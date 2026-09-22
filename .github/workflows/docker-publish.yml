@@ -1,5 +1,6 @@
 name: Publish svix-server
 
+# Rebuild after Docker Hub secrets were added.
 on:
   push:
     branches:
