@@ -4,15 +4,19 @@ use std::{net::TcpListener, sync::Arc, time::Duration};
 
 use axum::extract::State;
 use http::StatusCode;
-use svix_server::v1::{
-    endpoints::{attempt::MessageAttemptOut, endpoint::EndpointOut},
-    utils::ListResponse,
+use svix_server::{
+    core::types::MessageStatus,
+    v1::{
+        endpoints::{attempt::MessageAttemptOut, endpoint::EndpointOut},
+        utils::ListResponse,
+    },
 };
 use tokio::sync::Mutex;
 
 use crate::utils::{
     common_calls::{create_test_app, create_test_endpoint, create_test_message},
     get_default_test_config, run_with_retries, start_svix_server, start_svix_server_with_cfg,
+    TestReceiver,
 };
 
 /// Runs a full Axum server with two endpoints. The first endpoint redirects to the second endpoint
@@ -336,4 +340,57 @@ async fn test_endpoint_disable_on_sporadic_failure() {
 
         receiver.jh.abort();
     }
+}
+
+#[tokio::test]
+async fn test_http_400_is_not_retried() {
+    let mut cfg = get_default_test_config();
+    cfg.retry_schedule = vec![Duration::from_millis(50), Duration::from_millis(50)];
+
+    let receiver = TestReceiver::start(StatusCode::BAD_REQUEST);
+    let (client, _jh) = start_svix_server_with_cfg(&cfg).await;
+
+    let app_id = create_test_app(&client, "app").await.unwrap().id;
+    let _ep_id = create_test_endpoint(&client, &app_id, &receiver.endpoint)
+        .await
+        .unwrap()
+        .id;
+    let msg_id = create_test_message(&client, &app_id, serde_json::json!({}))
+        .await
+        .unwrap()
+        .id;
+
+    run_with_retries(|| async {
+        let attempts: ListResponse<MessageAttemptOut> = client
+            .get(
+                &format!("api/v1/app/{app_id}/attempt/msg/{msg_id}/"),
+                StatusCode::OK,
+            )
+            .await
+            .unwrap();
+
+        if attempts.data.is_empty() {
+            anyhow::bail!("No attempt found");
+        }
+
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let attempts: ListResponse<MessageAttemptOut> = client
+        .get(
+            &format!("api/v1/app/{app_id}/attempt/msg/{msg_id}/"),
+            StatusCode::OK,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(attempts.data.len(), 1);
+    assert_eq!(attempts.data[0].response_status_code, 400);
+    assert_eq!(attempts.data[0].status, MessageStatus::Fail);
+
+    receiver.jh.abort();
 }

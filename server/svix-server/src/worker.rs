@@ -544,6 +544,12 @@ fn calculate_retry_delay(
     rand::random_range(duration.mul_f32(1.0 - JITTER_DELTA)..=duration.mul_f32(1.0 + JITTER_DELTA))
 }
 
+/// 4xx is a contract answer from the receiver. Retrying the same payload will not change it,
+/// except 429 which is transient overload.
+fn is_terminal_client_error(status_code: i16) -> bool {
+    matches!(status_code, 400..=499 if status_code != 429)
+}
+
 #[tracing::instrument(skip_all, fields(response_code))]
 async fn handle_failed_dispatch(
     WorkerContext {
@@ -575,6 +581,8 @@ async fn handle_failed_dispatch(
     tracing::info!("Webhook failure.");
 
     let retry_schedule = &cfg.retry_schedule;
+    let status_code = *attempt.response_status_code.try_as_ref().unwrap_or(&0);
+    let skip_retry = is_terminal_client_error(status_code);
 
     let attempt_count = msg_task.attempt_count as usize;
     if msg_task.trigger_type == MessageAttemptTriggerType::Manual {
@@ -582,7 +590,7 @@ async fn handle_failed_dispatch(
         attempt.next_attempt = Set(None);
         attempt.insert(*db).await?;
         Ok(())
-    } else if attempt_count < retry_schedule.len() {
+    } else if !skip_retry && attempt_count < retry_schedule.len() {
         let retry_delay = calculate_retry_delay(retry_schedule[attempt_count], &err, retry_after);
         let next_attempt_time =
             Utc::now() + chrono::Duration::from_std(retry_delay).expect("Error parsing duration");
@@ -656,6 +664,11 @@ async fn handle_failed_dispatch(
                 }),
             )
             .await?;
+
+        // A 4xx reject is a finished delivery, not a dead endpoint.
+        if skip_retry {
+            return Ok(());
+        }
 
         match process_endpoint_failure(
             cache,
