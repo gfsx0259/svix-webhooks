@@ -237,10 +237,14 @@ impl MessageOut {
             let payload = content
                 .and_then(|p| match serde_json::from_slice(&p) {
                     Ok(v) => Some(v),
-                    Err(e) => {
-                        tracing::error!("Failed to parse content: {e}");
-                        None
-                    }
+                    // Raw form / text payloads are stored as-is and are not JSON.
+                    Err(_) => match String::from_utf8(p) {
+                        Ok(raw) => Some(serde_json::Value::String(raw)),
+                        Err(e) => {
+                            tracing::warn!("Message content is not valid UTF-8: {e}");
+                            None
+                        }
+                    },
                 })
                 .or(model.legacy_payload);
             RawPayload::from_string(match payload {

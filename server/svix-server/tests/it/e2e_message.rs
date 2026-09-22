@@ -821,7 +821,7 @@ async fn test_raw_payload_with_headers() {
 
     let form_body = "first_name=Ivan&email=ivan%40example.com";
 
-    let _: IgnoredAny = client
+    let created: MessageOut = client
         .post(
             &format!("api/v1/app/{app_id}/msg/"),
             json!({
@@ -840,6 +840,10 @@ async fn test_raw_payload_with_headers() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        created.payload.0.get(),
+        serde_json::to_string(form_body).unwrap()
+    );
 
     let (headers, body) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
         .await
