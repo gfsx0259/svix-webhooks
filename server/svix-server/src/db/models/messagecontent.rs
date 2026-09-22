@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
 // SPDX-License-Identifier: MIT
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 use sea_orm::{ActiveValue::Set, entity::prelude::*};
 
@@ -13,6 +15,8 @@ pub struct Model {
     pub id: MessageId,
     pub created_at: DateTimeWithTimeZone,
     pub payload: Vec<u8>,
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub headers: Option<Json>,
     pub expiration: DateTimeWithTimeZone,
 }
 
@@ -35,14 +39,29 @@ impl Related<super::message::Entity> for Entity {
 impl ActiveModelBehavior for ActiveModel {}
 
 impl ActiveModel {
-    pub fn new(msg_id: MessageId, payload: Vec<u8>, expiration: DateTimeWithTimeZone) -> Self {
+    pub fn new(
+        msg_id: MessageId,
+        payload: Vec<u8>,
+        headers: Option<Json>,
+        expiration: DateTimeWithTimeZone,
+    ) -> Self {
         let timestamp = Utc::now();
         Self {
             id: Set(msg_id),
             created_at: Set(timestamp.into()),
             payload: Set(payload),
+            headers: Set(headers),
             expiration: Set(expiration),
         }
+    }
+}
+
+impl Model {
+    pub fn parsed_headers(&self) -> HashMap<String, String> {
+        self.headers
+            .as_ref()
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
     }
 }
 

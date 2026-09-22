@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
 // SPDX-License-Identifier: MIT
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aide::axum::{
     ApiRouter,
@@ -154,12 +154,27 @@ impl MessageIn {
 
         self.payload.0.get().as_bytes().to_owned()
     }
+
+    fn headers(&self) -> Option<serde_json::Value> {
+        let headers = self.extra_params.as_ref()?.headers.as_ref()?;
+        if headers.is_empty() {
+            return None;
+        }
+        Some(serde_json::to_value(headers).expect("HashMap<String, String> is valid JSON"))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageInExtraParams {
     raw_payload: Option<String>,
+    /// Extra headers applied to the outbound webhook request.
+    ///
+    /// `content-type` is allowed so raw payloads can be delivered as
+    /// `application/x-www-form-urlencoded`. Svix-owned and hop-by-hop
+    /// headers are ignored at dispatch.
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
 }
 
 fn example_channel_set() -> Vec<&'static str> {
@@ -421,6 +436,7 @@ pub(crate) async fn create_message_inner(
     .ok_or_else(|| Error::generic(format_args!("Application doesn't exist: {}", app.id)))?;
 
     let payload = data.payload();
+    let headers = data.headers();
     let msg = message::ActiveModel {
         app_id: Set(app.id.clone()),
         org_id: Set(app.org_id),
@@ -431,8 +447,12 @@ pub(crate) async fn create_message_inner(
         .transaction(|txn| {
             async move {
                 let msg = msg.insert(txn).await.map_err(http_error_on_conflict)?;
-                let msg_content =
-                    messagecontent::ActiveModel::new(msg.id.clone(), payload, msg.expiration);
+                let msg_content = messagecontent::ActiveModel::new(
+                    msg.id.clone(),
+                    payload,
+                    headers,
+                    msg.expiration,
+                );
                 let msg_content = msg_content.insert(txn).await?;
                 Ok((msg, msg_content))
             }

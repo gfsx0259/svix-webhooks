@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
-// SPDX-Licensepub(crate) -Identifier: MIT
+// SPDX-License-Identifier: MIT
 
 use std::{
+    collections::HashMap,
     sync::{
         Arc, LazyLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -195,6 +196,55 @@ fn sign_msg(
         .to_string()
 }
 
+/// Headers a message is not allowed to override on dispatch.
+/// `content-type` is intentionally allowed so raw payloads can be sent as form data.
+fn is_overridable_message_header(name: &str) -> bool {
+    let k = name.to_ascii_lowercase();
+    if k == "content-type" {
+        return true;
+    }
+    if matches!(
+        k.as_str(),
+        "host"
+            | "user-agent"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "svix-id"
+            | "svix-timestamp"
+            | "svix-signature"
+            | "webhook-id"
+            | "webhook-timestamp"
+            | "webhook-signature"
+    ) {
+        return false;
+    }
+    if k.starts_with("svix-") || k.starts_with("x-svix-") || k.starts_with("webhook-") {
+        return false;
+    }
+    true
+}
+
+fn apply_extra_headers(headers: &mut CasePreservingHeaderMap, extra: &HashMap<String, String>) {
+    for (k, v) in extra {
+        match v.parse() {
+            Ok(v) => {
+                if let Err(e) = headers.try_insert(k, v) {
+                    tracing::error!("Invalid HeaderName {}: {}", k, e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Invalid HeaderValue {}: {}", v, e);
+            }
+        }
+    }
+}
+
 /// Generates a set of headers for any one webhook event
 fn generate_msg_headers(
     timestamp: i64,
@@ -202,6 +252,7 @@ fn generate_msg_headers(
     signatures: String,
     whitelabel_headers: bool,
     configured_headers: Option<&EndpointHeaders>,
+    message_headers: Option<&HashMap<String, String>>,
     _endpoint_url: &str,
 ) -> Result<CasePreservingHeaderMap> {
     let mut headers = CasePreservingHeaderMap::new();
@@ -228,18 +279,22 @@ fn generate_msg_headers(
     headers.insert(USER_AGENT, OUR_USER_AGENT);
     headers.insert(CONTENT_TYPE, APPLICATION_JSON);
     if let Some(configured_headers) = configured_headers {
-        for (k, v) in &configured_headers.0 {
-            match v.parse() {
-                Ok(v) => {
-                    if let Err(e) = headers.try_insert(k, v) {
-                        tracing::error!("Invalid HeaderName {}: {}", k, e);
-                    }
+        apply_extra_headers(&mut headers, &configured_headers.0);
+    }
+    if let Some(message_headers) = message_headers {
+        let allowed: HashMap<String, String> = message_headers
+            .iter()
+            .filter(|(k, _)| {
+                if is_overridable_message_header(k) {
+                    true
+                } else {
+                    tracing::warn!("Ignoring forbidden message header {k}");
+                    false
                 }
-                Err(e) => {
-                    tracing::error!("Invalid HeaderValue {}: {}", v, e);
-                }
-            }
-        }
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        apply_extra_headers(&mut headers, &allowed);
     }
 
     Ok(headers)
@@ -293,6 +348,7 @@ async fn prepare_dispatch(
     DispatchContext {
         msg_task,
         payload,
+        msg_headers,
         endp,
         ..
     }: DispatchContext<'_>,
@@ -316,6 +372,7 @@ async fn prepare_dispatch(
             signatures,
             cfg.whitelabel_headers,
             endp.headers.as_ref(),
+            Some(msg_headers),
             &endp.url,
         )?
     };
@@ -348,12 +405,16 @@ async fn make_http_call(
     }: PendingDispatch,
     client: &WebhookClient,
 ) -> Result<CompletedDispatch> {
+    let content_type = headers
+        .get(&CONTENT_TYPE)
+        .cloned()
+        .unwrap_or(APPLICATION_JSON);
     let req = RequestBuilder::new()
         .method(method)
         .uri_str(&url)
         .map_err(|e| Error::validation(format_args!("URL is invalid: {e:?}")))?
         .headers(headers)
-        .body(payload.into(), HeaderValue::from_static("application/json"))
+        .body(payload.into(), content_type)
         .version(Version::HTTP_11)
         .timeout(Duration::from_secs(request_timeout))
         .build()
@@ -725,6 +786,7 @@ async fn handle_failed_dispatch(
 struct DispatchContext<'a> {
     msg_task: &'a MessageTask,
     payload: &'a str,
+    msg_headers: &'a HashMap<String, String>,
     endp: &'a CreateMessageEndpoint,
     org_id: &'a OrganizationId,
     app_id: &'a ApplicationId,
@@ -748,6 +810,7 @@ async fn dispatch_message_task(
     app: &CreateMessageApp,
     msg_task: MessageTask,
     payload: &str,
+    msg_headers: &HashMap<String, String>,
     endp: CreateMessageEndpoint,
     status: MessageStatus,
 ) -> Result<()> {
@@ -775,6 +838,7 @@ async fn dispatch_message_task(
     let dispatch_context = DispatchContext {
         msg_task: &msg_task,
         payload,
+        msg_headers,
         endp: &endp,
         org_id: &app.org_id,
         app_id: &app.id,
@@ -918,13 +982,20 @@ async fn process_queue_task_inner(
     span.record("app_id", &msg.app_id.0);
     span.record("org_id", &msg.org_id.0);
 
-    let payload = msg_content
-        .and_then(|m| String::from_utf8(m.payload).ok())
-        .or_else(|| {
-            msg.legacy_payload
-                .take()
-                .and_then(|m| serde_json::to_string(&m).ok())
-        });
+    let (payload, msg_headers) = match msg_content {
+        Some(content) => {
+            let headers = content.parsed_headers();
+            let payload = String::from_utf8(content.payload).ok();
+            (payload, headers)
+        }
+        None => (None, HashMap::new()),
+    };
+
+    let payload = payload.or_else(|| {
+        msg.legacy_payload
+            .take()
+            .and_then(|m| serde_json::to_string(&m).ok())
+    });
 
     let Some(payload) = payload else {
         tracing::warn!("Message payload is NULL; payload has most likely expired");
@@ -970,6 +1041,7 @@ async fn process_queue_task_inner(
             &create_message_app,
             task,
             &payload,
+            &msg_headers,
             endpoint,
             status,
         )
@@ -1170,6 +1242,7 @@ mod tests {
                 signatures,
                 WHITELABEL_HEADERS,
                 None,
+                None,
                 ENDPOINT_URL,
             )
             .unwrap(),
@@ -1203,6 +1276,7 @@ mod tests {
             signatures,
             WHITELABEL_HEADERS,
             Some(&EndpointHeaders(headers)),
+            None,
             ENDPOINT_URL,
         )
         .unwrap();
@@ -1239,11 +1313,47 @@ mod tests {
             signatures,
             WHITELABEL_HEADERS,
             None,
+            None,
             ENDPOINT_URL,
         )
         .unwrap();
 
         assert_eq!(actual[&SVIX_SIGNATURE], expected_signature_str);
+    }
+
+    #[test]
+    fn test_generate_msg_headers_overrides_content_type() {
+        let mut message_headers = HashMap::new();
+        message_headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        message_headers.insert("svix-id".to_owned(), "msg_forged".to_owned());
+        message_headers.insert("x-custom".to_owned(), "yes".to_owned());
+
+        let id = MessageId::new(None, None);
+        let signatures = sign_msg(
+            &Encryption::new_noop(),
+            TIMESTAMP,
+            BODY,
+            &id,
+            ENDPOINT_SIGNING_KEYS,
+        );
+
+        let actual = generate_msg_headers(
+            TIMESTAMP,
+            &id,
+            signatures,
+            WHITELABEL_HEADERS,
+            None,
+            Some(&message_headers),
+            ENDPOINT_URL,
+        )
+        .unwrap();
+
+        assert_eq!(actual["content-type"], "application/x-www-form-urlencoded");
+        assert_eq!(actual["x-custom"], "yes");
+        assert_eq!(actual["svix-id"], id.0.as_str());
     }
 
     // Tests asymmetric signing keys

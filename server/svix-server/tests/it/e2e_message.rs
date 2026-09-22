@@ -776,6 +776,100 @@ async fn test_raw_payload() {
     assert_eq!(msg_payload.to_string(), rec_body.unwrap().to_string());
 }
 
+#[derive(Clone)]
+struct RawWebhookState {
+    tx: tokio::sync::mpsc::Sender<(http::HeaderMap, Vec<u8>)>,
+}
+
+async fn raw_webhook_route(
+    axum::extract::State(RawWebhookState { tx }): axum::extract::State<RawWebhookState>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::http::StatusCode {
+    tx.send((headers, body.to_vec())).await.unwrap();
+    axum::http::StatusCode::OK
+}
+
+#[tokio::test]
+async fn test_raw_payload_with_headers() {
+    let (client, _jh) = start_svix_server().await;
+
+    let app_id = create_test_app(&client, "testRawPayloadHeaders")
+        .await
+        .unwrap()
+        .id;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(http::HeaderMap, Vec<u8>)>(8);
+
+    let routes = axum::Router::new()
+        .route("/", axum::routing::post(raw_webhook_route))
+        .with_state(RawWebhookState { tx })
+        .into_make_service();
+
+    let _jh_recv = tokio::spawn(async move {
+        axum::serve(listener, routes).await.unwrap();
+    });
+
+    create_test_endpoint(&client, &app_id, &endpoint)
+        .await
+        .unwrap();
+
+    let form_body = "first_name=Ivan&email=ivan%40example.com";
+
+    let _: IgnoredAny = client
+        .post(
+            &format!("api/v1/app/{app_id}/msg/"),
+            json!({
+                "eventType": "payload.form",
+                "payload": {},
+                "transformationsParams": {
+                    "rawPayload": form_body,
+                    "headers": {
+                        "content-type": "application/x-www-form-urlencoded",
+                        "x-custom-lead": "1",
+                        "svix-id": "msg_forged",
+                    },
+                },
+            }),
+            StatusCode::ACCEPTED,
+        )
+        .await
+        .unwrap();
+
+    let (headers, body) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("timed out waiting for webhook")
+        .expect("receiver closed");
+
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default(),
+        "application/x-www-form-urlencoded"
+    );
+    assert_eq!(
+        headers
+            .get("x-custom-lead")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default(),
+        "1"
+    );
+    assert_ne!(
+        headers
+            .get("svix-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default(),
+        "msg_forged"
+    );
+    assert_eq!(body.as_slice(), form_body.as_bytes());
+}
+
 #[tokio::test]
 async fn test_create_message_with_application() {
     let (client, _jh) = start_svix_server().await;
