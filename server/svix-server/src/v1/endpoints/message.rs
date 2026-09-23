@@ -263,11 +263,12 @@ impl MessageOut {
     ) -> Self {
         let payload = if with_content {
             let payload = content
-                .and_then(|p| match serde_json::from_slice(&p) {
-                    Ok(v) => Some(v),
+                .and_then(|p| match serde_json::from_slice::<serde_json::Value>(&p) {
+                    Ok(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => Some(v),
+                    Ok(v) => Some(serde_json::json!({ "raw": v })),
                     // Raw form / text payloads are stored as-is and are not JSON.
                     Err(_) => match String::from_utf8(p) {
-                        Ok(raw) => Some(serde_json::Value::String(raw)),
+                        Ok(raw) => Some(serde_json::json!({ "raw": raw })),
                         Err(e) => {
                             tracing::warn!("Message content is not valid UTF-8: {e}");
                             None

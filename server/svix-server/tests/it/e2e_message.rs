@@ -997,6 +997,41 @@ async fn test_raw_payload_post_query() {
     assert!(body.is_empty());
 }
 
+#[tokio::test]
+async fn test_raw_payloads_are_returned_as_objects() {
+    let (client, _jh) = start_svix_server().await;
+
+    let app_id = create_test_app(&client, "testRawPayloadObjects")
+        .await
+        .unwrap()
+        .id;
+
+    for (raw, expected) in [
+        (
+            "first_name=Ivan&email=ivan%40example.com",
+            json!({ "raw": "first_name=Ivan&email=ivan%40example.com" }),
+        ),
+        ("", json!({ "raw": "" })),
+        ("42", json!({ "raw": 42 })),
+    ] {
+        let msg: MessageOut = client
+            .post(
+                &format!("api/v1/app/{app_id}/msg/"),
+                json!({
+                    "eventType": "payload.raw.object",
+                    "payload": {},
+                    "transformationsParams": { "rawPayload": raw },
+                }),
+                StatusCode::ACCEPTED,
+            )
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(msg.payload.0.get()).unwrap();
+        assert_eq!(payload, expected);
+    }
+}
+
 #[derive(Clone)]
 struct RawGetWebhookState {
     tx: tokio::sync::mpsc::Sender<(String, String, Vec<u8>)>,
