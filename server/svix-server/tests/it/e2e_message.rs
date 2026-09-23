@@ -842,7 +842,7 @@ async fn test_raw_payload_with_headers() {
         .unwrap();
     assert_eq!(
         created.payload.0.get(),
-        serde_json::to_string(form_body).unwrap()
+        json!({ "raw": form_body }).to_string()
     );
 
     let (headers, body) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
