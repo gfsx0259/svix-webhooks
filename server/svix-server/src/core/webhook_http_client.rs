@@ -447,11 +447,13 @@ impl RequestBuilder {
         // Ensure that host header is first -- even though this is technically
         // not required by HTTP spec, some clients fail if it's not first:
         headers.insert(http::header::HOST, host);
-        headers.insert(http::header::ACCEPT, self.accept.unwrap_or(STAR_SLASH_STAR));
         headers.insert(
-            http::header::CONTENT_TYPE,
-            self.content_type.unwrap_or(APPLICATION_JSON),
+            http::header::ACCEPT,
+            self.accept.unwrap_or(STAR_SLASH_STAR),
         );
+        if let Some(content_type) = self.content_type {
+            headers.insert(http::header::CONTENT_TYPE, content_type);
+        }
 
         if let Some(user_agent) = self.user_agent {
             headers.insert(http::header::USER_AGENT, user_agent);

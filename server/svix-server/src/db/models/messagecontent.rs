@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
+use http::Method;
 use sea_orm::{ActiveValue::Set, entity::prelude::*};
 
 use crate::core::types::MessageId;
@@ -17,6 +18,7 @@ pub struct Model {
     pub payload: Vec<u8>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub headers: Option<Json>,
+    pub method: Option<String>,
     pub expiration: DateTimeWithTimeZone,
 }
 
@@ -43,6 +45,7 @@ impl ActiveModel {
         msg_id: MessageId,
         payload: Vec<u8>,
         headers: Option<Json>,
+        method: Option<String>,
         expiration: DateTimeWithTimeZone,
     ) -> Self {
         let timestamp = Utc::now();
@@ -51,6 +54,7 @@ impl ActiveModel {
             created_at: Set(timestamp.into()),
             payload: Set(payload),
             headers: Set(headers),
+            method: Set(method),
             expiration: Set(expiration),
         }
     }
@@ -62,6 +66,18 @@ impl Model {
             .as_ref()
             .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default()
+    }
+
+    pub fn parsed_method(&self) -> Method {
+        match self
+            .method
+            .as_deref()
+            .map(|m| m.trim().to_ascii_uppercase())
+            .as_deref()
+        {
+            Some("GET") => Method::GET,
+            _ => Method::POST,
+        }
     }
 }
 

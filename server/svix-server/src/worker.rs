@@ -245,6 +245,52 @@ fn apply_extra_headers(headers: &mut CasePreservingHeaderMap, extra: &HashMap<St
     }
 }
 
+fn payload_as_query(payload: &str) -> String {
+    let trimmed = payload.trim().trim_start_matches('?');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(obj) = value.as_object() {
+            let mut serializer = form_urlencoded::Serializer::new(String::new());
+            for (key, val) in obj {
+                match val {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::String(s) => {
+                        serializer.append_pair(key, s);
+                    }
+                    serde_json::Value::Number(n) => {
+                        serializer.append_pair(key, &n.to_string());
+                    }
+                    serde_json::Value::Bool(b) => {
+                        serializer.append_pair(key, if *b { "1" } else { "0" });
+                    }
+                    other => {
+                        serializer.append_pair(key, &other.to_string());
+                    }
+                }
+            }
+            return serializer.finish();
+        }
+    }
+    trimmed.to_owned()
+}
+
+fn append_query(url: &str, query: &str) -> String {
+    if query.is_empty() {
+        return url.to_owned();
+    }
+    if url.contains('?') {
+        if url.ends_with('?') || url.ends_with('&') {
+            format!("{url}{query}")
+        } else {
+            format!("{url}&{query}")
+        }
+    } else {
+        format!("{url}?{query}")
+    }
+}
+
 /// Generates a set of headers for any one webhook event
 fn generate_msg_headers(
     timestamp: i64,
@@ -349,13 +395,14 @@ async fn prepare_dispatch(
         msg_task,
         payload,
         msg_headers,
+        msg_method,
         endp,
         ..
     }: DispatchContext<'_>,
 ) -> Result<IncompleteDispatch> {
     let attempt_created_at = Utc::now();
 
-    let headers = {
+    let mut headers = {
         let keys = endp.valid_signing_keys();
 
         let signatures = sign_msg(
@@ -377,11 +424,22 @@ async fn prepare_dispatch(
         )?
     };
 
+    let (method, url, body) = if msg_method == &http::Method::GET {
+        headers.remove(&CONTENT_TYPE);
+        (
+            http::Method::GET,
+            append_query(&endp.url, &payload_as_query(payload)),
+            String::new(),
+        )
+    } else {
+        (http::Method::POST, endp.url.clone(), payload.to_owned())
+    };
+
     Ok(IncompleteDispatch::Pending(PendingDispatch {
-        method: http::Method::POST,
-        url: endp.url.clone(),
+        method,
+        url,
         headers,
-        payload: payload.to_owned(),
+        payload: body,
         request_timeout: cfg.worker_request_timeout as _,
         created_at: attempt_created_at,
     }))
@@ -405,20 +463,22 @@ async fn make_http_call(
     }: PendingDispatch,
     client: &WebhookClient,
 ) -> Result<CompletedDispatch> {
+    let is_get = method == http::Method::GET;
     let content_type = headers
         .get(&CONTENT_TYPE)
         .cloned()
         .unwrap_or(APPLICATION_JSON);
-    let req = RequestBuilder::new()
+    let mut builder = RequestBuilder::new()
         .method(method)
         .uri_str(&url)
         .map_err(|e| Error::validation(format_args!("URL is invalid: {e:?}")))?
         .headers(headers)
-        .body(payload.into(), content_type)
         .version(Version::HTTP_11)
-        .timeout(Duration::from_secs(request_timeout))
-        .build()
-        .map_err(Error::generic)?;
+        .timeout(Duration::from_secs(request_timeout));
+    if !is_get {
+        builder = builder.body(payload.into(), content_type);
+    }
+    let req = builder.build().map_err(Error::generic)?;
 
     let attempt = messageattempt::ActiveModel {
         // Set both ID and created_at to the same timestamp
@@ -427,7 +487,7 @@ async fn make_http_call(
         msg_id: Set(msg_task.msg_id.clone()),
         endp_id: Set(endp.id.clone()),
         msg_dest_id: Set(None),
-        url: Set(endp.url.clone()),
+        url: Set(url),
         ended_at: Set(Some(Utc::now().into())),
         trigger_type: Set(msg_task.trigger_type),
         response_duration_ms: Set(0), // Default to 0, will be updated after the request
@@ -787,6 +847,7 @@ struct DispatchContext<'a> {
     msg_task: &'a MessageTask,
     payload: &'a str,
     msg_headers: &'a HashMap<String, String>,
+    msg_method: &'a http::Method,
     endp: &'a CreateMessageEndpoint,
     org_id: &'a OrganizationId,
     app_id: &'a ApplicationId,
@@ -811,6 +872,7 @@ async fn dispatch_message_task(
     msg_task: MessageTask,
     payload: &str,
     msg_headers: &HashMap<String, String>,
+    msg_method: &http::Method,
     endp: CreateMessageEndpoint,
     status: MessageStatus,
 ) -> Result<()> {
@@ -839,6 +901,7 @@ async fn dispatch_message_task(
         msg_task: &msg_task,
         payload,
         msg_headers,
+        msg_method,
         endp: &endp,
         org_id: &app.org_id,
         app_id: &app.id,
@@ -982,13 +1045,14 @@ async fn process_queue_task_inner(
     span.record("app_id", &msg.app_id.0);
     span.record("org_id", &msg.org_id.0);
 
-    let (payload, msg_headers) = match msg_content {
+    let (payload, msg_headers, msg_method) = match msg_content {
         Some(content) => {
             let headers = content.parsed_headers();
+            let method = content.parsed_method();
             let payload = String::from_utf8(content.payload).ok();
-            (payload, headers)
+            (payload, headers, method)
         }
-        None => (None, HashMap::new()),
+        None => (None, HashMap::new(), http::Method::POST),
     };
 
     let payload = payload.or_else(|| {
@@ -1042,6 +1106,7 @@ async fn process_queue_task_inner(
             task,
             &payload,
             &msg_headers,
+            &msg_method,
             endpoint,
             status,
         )
@@ -1207,8 +1272,8 @@ mod tests {
     use http::HeaderMap;
 
     use super::{
-        CasePreservingHeaderMap, SVIX_SIGNATURE, bytes_to_string, generate_msg_headers,
-        retry_after, sign_msg,
+        CasePreservingHeaderMap, SVIX_SIGNATURE, append_query, bytes_to_string,
+        generate_msg_headers, payload_as_query, retry_after, sign_msg,
     };
     use crate::core::{
         cryptography::{AsymmetricKey, Encryption},
@@ -1354,6 +1419,23 @@ mod tests {
         assert_eq!(actual["content-type"], "application/x-www-form-urlencoded");
         assert_eq!(actual["x-custom"], "yes");
         assert_eq!(actual["svix-id"], id.0.as_str());
+    }
+
+    #[test]
+    fn test_payload_as_query_and_append() {
+        assert_eq!(payload_as_query("email=123&phone=123"), "email=123&phone=123");
+        assert_eq!(
+            payload_as_query(r#"{"email":"a@b.c","phone":"123"}"#),
+            "email=a%40b.c&phone=123"
+        );
+        assert_eq!(
+            append_query("https://partner.test/lead", "email=1"),
+            "https://partner.test/lead?email=1"
+        );
+        assert_eq!(
+            append_query("https://partner.test/lead?api=1", "email=1"),
+            "https://partner.test/lead?api=1&email=1"
+        );
     }
 
     // Tests asymmetric signing keys

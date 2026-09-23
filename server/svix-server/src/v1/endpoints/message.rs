@@ -162,6 +162,15 @@ impl MessageIn {
         }
         Some(serde_json::to_value(headers).expect("HashMap<String, String> is valid JSON"))
     }
+
+    fn method(&self) -> Option<String> {
+        let method = self.extra_params.as_ref()?.method.as_ref()?;
+        match method.trim().to_ascii_uppercase().as_str() {
+            "GET" => Some("GET".to_owned()),
+            "POST" => Some("POST".to_owned()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -175,6 +184,10 @@ pub struct MessageInExtraParams {
     /// headers are ignored at dispatch.
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+    /// Outbound HTTP method. `GET` puts `rawPayload` (or a JSON object payload)
+    /// into the query string and sends an empty body. Anything else is POST.
+    #[serde(default)]
+    method: Option<String>,
 }
 
 fn example_channel_set() -> Vec<&'static str> {
@@ -441,6 +454,7 @@ pub(crate) async fn create_message_inner(
 
     let payload = data.payload();
     let headers = data.headers();
+    let method = data.method();
     let msg = message::ActiveModel {
         app_id: Set(app.id.clone()),
         org_id: Set(app.org_id),
@@ -455,6 +469,7 @@ pub(crate) async fn create_message_inner(
                     msg.id.clone(),
                     payload,
                     headers,
+                    method,
                     msg.expiration,
                 );
                 let msg_content = msg_content.insert(txn).await?;
