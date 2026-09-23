@@ -935,6 +935,68 @@ async fn test_raw_payload_get_query() {
     assert!(body.is_empty());
 }
 
+#[tokio::test]
+async fn test_raw_payload_post_query() {
+    let (client, _jh) = start_svix_server().await;
+
+    let app_id = create_test_app(&client, "testRawPayloadPostQuery")
+        .await
+        .unwrap()
+        .id;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, Vec<u8>)>(8);
+
+    let routes = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(raw_get_webhook_route).post(raw_get_webhook_route),
+        )
+        .with_state(RawGetWebhookState { tx })
+        .into_make_service();
+
+    let _jh_recv = tokio::spawn(async move {
+        axum::serve(listener, routes).await.unwrap();
+    });
+
+    create_test_endpoint(&client, &app_id, &endpoint)
+        .await
+        .unwrap();
+
+    let query = "email=123&phone=123";
+
+    let _: IgnoredAny = client
+        .post(
+            &format!("api/v1/app/{app_id}/msg/"),
+            json!({
+                "eventType": "payload.post.query",
+                "payload": {},
+                "transformationsParams": {
+                    "rawPayload": "",
+                    "query": query,
+                    "method": "POST",
+                },
+            }),
+            StatusCode::ACCEPTED,
+        )
+        .await
+        .unwrap();
+
+    let (method, received_query, body) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out waiting for webhook")
+            .expect("receiver closed");
+
+    assert_eq!(method, "POST");
+    assert_eq!(received_query, query);
+    assert!(body.is_empty());
+}
+
 #[derive(Clone)]
 struct RawGetWebhookState {
     tx: tokio::sync::mpsc::Sender<(String, String, Vec<u8>)>,

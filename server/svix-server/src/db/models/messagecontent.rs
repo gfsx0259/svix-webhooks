@@ -19,6 +19,7 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub headers: Option<Json>,
     pub method: Option<String>,
+    pub query: Option<String>,
     pub expiration: DateTimeWithTimeZone,
 }
 
@@ -46,6 +47,7 @@ impl ActiveModel {
         payload: Vec<u8>,
         headers: Option<Json>,
         method: Option<String>,
+        query: Option<String>,
         expiration: DateTimeWithTimeZone,
     ) -> Self {
         let timestamp = Utc::now();
@@ -55,6 +57,7 @@ impl ActiveModel {
             payload: Set(payload),
             headers: Set(headers),
             method: Set(method),
+            query: Set(query),
             expiration: Set(expiration),
         }
     }
@@ -78,6 +81,15 @@ impl Model {
             Some("GET") => Method::GET,
             _ => Method::POST,
         }
+    }
+
+    pub fn parsed_query(&self) -> String {
+        self.query
+            .as_deref()
+            .map(|q| q.trim().trim_start_matches('?'))
+            .filter(|q| !q.is_empty())
+            .unwrap_or_default()
+            .to_owned()
     }
 }
 

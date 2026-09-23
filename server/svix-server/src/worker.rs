@@ -396,6 +396,7 @@ async fn prepare_dispatch(
         payload,
         msg_headers,
         msg_method,
+        msg_query,
         endp,
         ..
     }: DispatchContext<'_>,
@@ -424,16 +425,16 @@ async fn prepare_dispatch(
         )?
     };
 
-    let (method, url, body) = if msg_method == &http::Method::GET {
-        headers.remove(&CONTENT_TYPE);
-        (
-            http::Method::GET,
-            append_query(&endp.url, &payload_as_query(payload)),
-            String::new(),
-        )
+    let mut url = append_query(&endp.url, &payload_as_query(msg_query));
+    let (method, body) = if msg_method == &http::Method::GET {
+        url = append_query(&url, &payload_as_query(payload));
+        (http::Method::GET, String::new())
     } else {
-        (http::Method::POST, endp.url.clone(), payload.to_owned())
+        (http::Method::POST, payload.to_owned())
     };
+    if body.is_empty() {
+        headers.remove(&CONTENT_TYPE);
+    }
 
     Ok(IncompleteDispatch::Pending(PendingDispatch {
         method,
@@ -463,7 +464,7 @@ async fn make_http_call(
     }: PendingDispatch,
     client: &WebhookClient,
 ) -> Result<CompletedDispatch> {
-    let is_get = method == http::Method::GET;
+    let empty_body = method == http::Method::GET || payload.is_empty();
     let content_type = headers
         .get(&CONTENT_TYPE)
         .cloned()
@@ -475,7 +476,7 @@ async fn make_http_call(
         .headers(headers)
         .version(Version::HTTP_11)
         .timeout(Duration::from_secs(request_timeout));
-    if !is_get {
+    if !empty_body {
         builder = builder.body(payload.into(), content_type);
     }
     let req = builder.build().map_err(Error::generic)?;
@@ -848,6 +849,7 @@ struct DispatchContext<'a> {
     payload: &'a str,
     msg_headers: &'a HashMap<String, String>,
     msg_method: &'a http::Method,
+    msg_query: &'a str,
     endp: &'a CreateMessageEndpoint,
     org_id: &'a OrganizationId,
     app_id: &'a ApplicationId,
@@ -873,6 +875,7 @@ async fn dispatch_message_task(
     payload: &str,
     msg_headers: &HashMap<String, String>,
     msg_method: &http::Method,
+    msg_query: &str,
     endp: CreateMessageEndpoint,
     status: MessageStatus,
 ) -> Result<()> {
@@ -902,6 +905,7 @@ async fn dispatch_message_task(
         payload,
         msg_headers,
         msg_method,
+        msg_query,
         endp: &endp,
         org_id: &app.org_id,
         app_id: &app.id,
@@ -1045,14 +1049,15 @@ async fn process_queue_task_inner(
     span.record("app_id", &msg.app_id.0);
     span.record("org_id", &msg.org_id.0);
 
-    let (payload, msg_headers, msg_method) = match msg_content {
+    let (payload, msg_headers, msg_method, msg_query) = match msg_content {
         Some(content) => {
             let headers = content.parsed_headers();
             let method = content.parsed_method();
+            let query = content.parsed_query();
             let payload = String::from_utf8(content.payload).ok();
-            (payload, headers, method)
+            (payload, headers, method, query)
         }
-        None => (None, HashMap::new(), http::Method::POST),
+        None => (None, HashMap::new(), http::Method::POST, String::new()),
     };
 
     let payload = payload.or_else(|| {
@@ -1107,6 +1112,7 @@ async fn process_queue_task_inner(
             &payload,
             &msg_headers,
             &msg_method,
+            &msg_query,
             endpoint,
             status,
         )

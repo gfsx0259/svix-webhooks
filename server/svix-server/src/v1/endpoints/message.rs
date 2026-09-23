@@ -171,6 +171,16 @@ impl MessageIn {
             _ => None,
         }
     }
+
+    fn query(&self) -> Option<String> {
+        let query = self.extra_params.as_ref()?.query.as_ref()?;
+        let trimmed = query.trim().trim_start_matches('?');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -188,6 +198,11 @@ pub struct MessageInExtraParams {
     /// into the query string and sends an empty body. Anything else is POST.
     #[serde(default)]
     method: Option<String>,
+    /// Extra query string appended to the endpoint URL for any method.
+    /// Use with POST and an empty `rawPayload` to send fields in the URL
+    /// and an empty body.
+    #[serde(default)]
+    query: Option<String>,
 }
 
 fn example_channel_set() -> Vec<&'static str> {
@@ -455,6 +470,7 @@ pub(crate) async fn create_message_inner(
     let payload = data.payload();
     let headers = data.headers();
     let method = data.method();
+    let query = data.query();
     let msg = message::ActiveModel {
         app_id: Set(app.id.clone()),
         org_id: Set(app.org_id),
@@ -470,6 +486,7 @@ pub(crate) async fn create_message_inner(
                     payload,
                     headers,
                     method,
+                    query,
                     msg.expiration,
                 );
                 let msg_content = msg_content.insert(txn).await?;
